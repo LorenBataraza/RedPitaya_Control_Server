@@ -1,0 +1,3 @@
+[submodule "RedPitaya"]
+	path = RedPitaya
+	url = https://github.com/RedPitaya/RedPitaya
