@@ -25,9 +25,11 @@
  *  Uso:  ./control_server <puerto_hardware> <puerto_admin>
  * ========================================================================== */
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/select.h>
 
 #include <atomic>
 #include <cstring>
@@ -51,8 +53,16 @@
 static std::list<hardware_clients> hardware_client_table;
 static std::mutex hw_table_mtx;
 
-// Una Cmd Shm_Queue por device (clave = MAC del device).
-static std::map<device_mac, ShmQueue<cmd_t>*> cmd_queues;
+// Una Cmd Shm_Queue por device + un self-pipe de notificación.
+// El semáforo de la ShmQueue no es select()-able, así que el Controller,
+// además de Put() en la cola, escribe 1 byte en `notify_w`. El Hardware
+// Handler hace select() sobre el socket del device y el extremo de lectura
+// del pipe, para no quedar ciego al socket mientras espera comandos.
+struct DeviceChannel {
+    ShmQueue<cmd_t>* cmd_q;
+    int              notify_w;  // Extremo de escritura del self-pipe.
+};
+static std::map<device_mac, DeviceChannel> cmd_queues;
 static std::mutex cmd_queues_mtx;
 
 // Mensaje que viaja por la Msg queue desde un Hardware Handler al Msg Handler.
@@ -134,41 +144,100 @@ static void broadcast_to_admins(const cmd_t& ev, const std::string& pl = "") {
     }
 }
 
+// EVENT no solicitado emitido por el device (ej. STD_OUTDEVICE): se reenvía
+// a los Admins. Lo invoca tanto el select() del handler como, durante una
+// llamada Request-Response, write_cmd_and_wait_response() vía callback.
+static void on_hw_event(const cmd_t& ev, const std::string& pl) {
+    broadcast_to_admins(ev, pl);
+}
+
 // ---------------------------------------------------------------------------
 //  Hardware Handler  (1 hilo por device)
 // ---------------------------------------------------------------------------
 static void hardware_handler(int hw_socket, device_mac mac,
-                             ShmQueue<cmd_t>* cmd_q) {
+                             ShmQueue<cmd_t>* cmd_q,
+                             int notify_r, int notify_w) {
     printf("[hw-handler] device %012llx: handler arrancado\n",
            (unsigned long long)mac);
 
-    for (;;) {
-        // Bloquea hasta que el Controller encole un comando para este device.
-        cmd_t cmd = cmd_q->Get();
+    // Extremo de lectura del self-pipe en no-bloqueante: lo drenamos entero.
+    fcntl(notify_r, F_SETFL, O_NONBLOCK);
 
-        // CTRL_BYE interno: el device se va, terminamos el handler.
-        if (cmd.header.api_id.family == API_CONTROL &&
-            cmd.header.api_id.function_id == CTRL_BYE) {
+    bool device_gone = false;
+
+    while (!device_gone) {
+        // --- select() sobre AMBAS fuentes bloqueantes -------------------
+        // notify_r : el Controller encoló comando(s) en la Cmd queue.
+        // hw_socket: el device mandó algo no solicitado (EVENT) o se cayó.
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(hw_socket, &rfds);
+        FD_SET(notify_r, &rfds);
+        int maxfd = (hw_socket > notify_r ? hw_socket : notify_r) + 1;
+
+        int s = select(maxfd, &rfds, nullptr, nullptr, nullptr);
+        if (s < 0) {
+            if (errno == EINTR) continue;
+            device_gone = true;
             break;
         }
 
-        // Request-Response bloqueante contra el hardware.
-        cmd_t resp{};
-        std::string resp_pl;
-        bool ok = write_cmd_and_wait_response(hw_socket, cmd, &resp, &resp_pl);
-
-        if (!ok) {
-            // El device se cayó: notificamos como respuesta de error y salimos.
-            cmd_t gone = cmd;
-            gone.header.type = RESPONSE;
-            gone.body.retval = -1;
-            push_msg(gone, "device disconnected\n");
-            break;
+        // --- Actividad en el socket del device SIN comando pendiente ----
+        // Sólo puede ser un EVENT no solicitado (STD_OUTDEVICE) o el cierre
+        // de la conexión: así detectamos la caída en cualquier momento.
+        if (FD_ISSET(hw_socket, &rfds)) {
+            cmd_t in{};
+            std::string pl;
+            if (!read_cmd(hw_socket, &in, &pl)) {
+                device_gone = true;
+                break;
+            }
+            if (in.header.type == EVENT) {
+                on_hw_event(in, pl);
+            }
+            // Una RESPONSE sin request pendiente se descarta.
+            continue;
         }
 
-        // Empujamos la respuesta a la Msg queue para que el Msg Handler la
-        // rutee de vuelta al Admin que la pidió.
-        push_msg(resp, resp_pl);
+        // --- Hay comando(s) del Controller en la Cmd queue -------------
+        if (FD_ISSET(notify_r, &rfds)) {
+            // Drenamos el pipe: 1 byte == 1 elemento ya Put() en la cola
+            // (el byte se escribe DESPUÉS del Put, así que Get() no bloquea).
+            char drain[256];
+            int pending = 0;
+            ssize_t r;
+            while ((r = read(notify_r, drain, sizeof(drain))) > 0)
+                pending += (int)r;
+
+            for (int i = 0; i < pending && !device_gone; ++i) {
+                cmd_t cmd = cmd_q->Get();
+
+                // CTRL_BYE interno: el device se va, terminamos el handler.
+                if (cmd.header.api_id.family == API_CONTROL &&
+                    cmd.header.api_id.function_id == CTRL_BYE) {
+                    device_gone = true;
+                    break;
+                }
+
+                // Request-Response bloqueante contra el hardware. Los EVENT
+                // que lleguen mientras esperamos la RESPONSE se reenvían
+                // por on_hw_event sin perder la correlación por request_id.
+                cmd_t resp{};
+                std::string resp_pl;
+                bool ok = write_cmd_and_wait_response(
+                    hw_socket, cmd, &resp, &resp_pl, "", on_hw_event);
+
+                if (!ok) {
+                    cmd_t gone = cmd;
+                    gone.header.type = RESPONSE;
+                    gone.body.retval = -1;
+                    push_msg(gone, "device disconnected\n");
+                    device_gone = true;
+                    break;
+                }
+                push_msg(resp, resp_pl);
+            }
+        }
     }
 
     // --- Limpieza: el device se fue ---
@@ -187,6 +256,8 @@ static void hardware_handler(int hw_socket, device_mac mac,
         std::lock_guard<std::mutex> lk(cmd_queues_mtx);
         cmd_queues.erase(mac);
     }
+    close(notify_r);
+    close(notify_w);
     cmd_q->Detach();
     ShmQueue<cmd_t>::Destroy(cmd_queue_name(mac).c_str());
     // Aviso a los Admins (EVENT, sin respuesta esperada).
@@ -231,9 +302,15 @@ static void connection_point(int listen_fd) {
         ShmQueue<cmd_t>* q =
             ShmQueue<cmd_t>::Create(cmd_queue_name(hc.hardware_mac).c_str(),
                                     QUEUE_CAP);
+        int notify[2];
+        if (pipe(notify) < 0) {
+            close(hw_fd);
+            ShmQueue<cmd_t>::Destroy(cmd_queue_name(hc.hardware_mac).c_str());
+            continue;
+        }
         {
             std::lock_guard<std::mutex> lk(cmd_queues_mtx);
-            cmd_queues[hc.hardware_mac] = q;
+            cmd_queues[hc.hardware_mac] = DeviceChannel{q, notify[1]};
         }
 
         // Respondemos "aceptado" con el id asignado.
@@ -245,7 +322,8 @@ static void connection_point(int listen_fd) {
         printf("[conn-point] device %012llx aceptado (id=%d)\n",
                (unsigned long long)hc.hardware_mac, hc.hardware_id);
 
-        std::thread(hardware_handler, hw_fd, hc.hardware_mac, q).detach();
+        std::thread(hardware_handler, hw_fd, hc.hardware_mac, q,
+                    notify[0], notify[1]).detach();
     }
 }
 
@@ -307,10 +385,14 @@ static void controller(int admin_fd) {
         }
 
         ShmQueue<cmd_t>* q = nullptr;
+        int notify_w = -1;
         {
             std::lock_guard<std::mutex> lk(cmd_queues_mtx);
             auto it = cmd_queues.find(cmd.body.destination_device);
-            if (it != cmd_queues.end()) q = it->second;
+            if (it != cmd_queues.end()) {
+                q = it->second.cmd_q;
+                notify_w = it->second.notify_w;
+            }
         }
 
         if (!q) {
@@ -324,8 +406,13 @@ static void controller(int admin_fd) {
             continue;
         }
 
-        // Encolamos en la Cmd queue del device: lo tomará su Hardware Handler.
+        // Encolamos en la Cmd queue del device y despertamos su select()
+        // con 1 byte en el self-pipe (Put antes que el byte: cuando el
+        // Handler ve el byte, el elemento ya está en la cola).
         q->Put(cmd);
+        const char tick = 1;
+        ssize_t wn = write(notify_w, &tick, 1);
+        (void)wn;
     }
 
 done:
