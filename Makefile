@@ -7,7 +7,7 @@ BINS = control_server hardware_client admin_client
 all: $(BINS)
 
 control_server: control_server.cpp api.cpp include/ShmQueue.h
-	$(CXX) $(CXXFLAGS) -o $@ control_server.cpp $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -o $@ control_server.cpp $(LDFLAGS) -lrt
 
 hardware_client: hardware_client.cpp api.cpp
 	$(CXX) $(CXXFLAGS) -o $@ hardware_client.cpp $(LDFLAGS)

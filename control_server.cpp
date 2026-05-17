@@ -30,12 +30,13 @@
 #include <stdlib.h>
 
 #include <atomic>
+#include <cstring>
+#include <list>
 #include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <vector>
 
 #include "api.cpp"
 #include "include/ShmQueue.h"
@@ -45,7 +46,9 @@
 // ---------------------------------------------------------------------------
 
 // Tabla de clientes de hardware conectados (hd_client_list).
-static std::vector<hardware_clients> hardware_client_table;
+// std::list: erase O(1) por iterador y no invalida referencias a otros
+// elementos cuando un device se desconecta (a diferencia de vector).
+static std::list<hardware_clients> hardware_client_table;
 static std::mutex hw_table_mtx;
 
 // Una Cmd Shm_Queue por device (clave = MAC del device).
@@ -53,11 +56,36 @@ static std::map<device_mac, ShmQueue<cmd_t>*> cmd_queues;
 static std::mutex cmd_queues_mtx;
 
 // Mensaje que viaja por la Msg queue desde un Hardware Handler al Msg Handler.
+// POD (vive en memoria compartida): el payload va en buffer de tamaño fijo.
+static const size_t MSG_PAYLOAD_MAX = 1024;
 struct Msg {
-    cmd_t       cmd;
-    std::string payload;
+    cmd_t    cmd;
+    uint32_t payload_len;
+    char     payload[MSG_PAYLOAD_MAX];
 };
-static ShmQueue<Msg> msg_queue;
+
+static const char *MSG_QUEUE_NAME = "/rpcs_msgq";
+static const size_t QUEUE_CAP = 64;
+static ShmQueue<Msg> *msg_queue = nullptr;
+
+// Nombre de shm para la Cmd queue de un device a partir de su MAC.
+static std::string cmd_queue_name(device_mac mac) {
+    char n[40];
+    snprintf(n, sizeof(n), "/rpcs_cmdq_%012llx", (unsigned long long)mac);
+    return n;
+}
+
+// Empuja una respuesta a la Msg queue copiando el payload (truncado) al POD.
+static void push_msg(const cmd_t &cmd, const std::string &payload) {
+    Msg m{};
+    m.cmd = cmd;
+    size_t n = payload.size();
+    if (n > MSG_PAYLOAD_MAX - 1) n = MSG_PAYLOAD_MAX - 1;
+    memcpy(m.payload, payload.data(), n);
+    m.payload[n] = '\0';
+    m.payload_len = (uint32_t)n;
+    msg_queue->Put(m);
+}
 
 // Llamada pendiente de respuesta: request_id -> admin que la originó.
 struct PendingCall {
@@ -116,7 +144,7 @@ static void hardware_handler(int hw_socket, device_mac mac,
 
     for (;;) {
         // Bloquea hasta que el Controller encole un comando para este device.
-        cmd_t cmd = cmd_q->pop();
+        cmd_t cmd = cmd_q->Get();
 
         // CTRL_BYE interno: el device se va, terminamos el handler.
         if (cmd.header.api_id.family == API_CONTROL &&
@@ -134,13 +162,13 @@ static void hardware_handler(int hw_socket, device_mac mac,
             cmd_t gone = cmd;
             gone.header.type = RESPONSE;
             gone.body.retval = -1;
-            msg_queue.push({gone, "device disconnected\n"});
+            push_msg(gone, "device disconnected\n");
             break;
         }
 
         // Empujamos la respuesta a la Msg queue para que el Msg Handler la
         // rutee de vuelta al Admin que la pidió.
-        msg_queue.push({resp, std::move(resp_pl)});
+        push_msg(resp, resp_pl);
     }
 
     // --- Limpieza: el device se fue ---
@@ -157,12 +185,10 @@ static void hardware_handler(int hw_socket, device_mac mac,
     }
     {
         std::lock_guard<std::mutex> lk(cmd_queues_mtx);
-        auto it = cmd_queues.find(mac);
-        if (it != cmd_queues.end()) {
-            delete it->second;
-            cmd_queues.erase(it);
-        }
+        cmd_queues.erase(mac);
     }
+    cmd_q->Detach();
+    ShmQueue<cmd_t>::Destroy(cmd_queue_name(mac).c_str());
     // Aviso a los Admins (EVENT, sin respuesta esperada).
     cmd_t ev = make_cmd(API_CONTROL, CTRL_DEVICE_GONE, EVENT, mac);
     broadcast_to_admins(ev);
@@ -202,7 +228,9 @@ static void connection_point(int listen_fd) {
             hardware_client_table.push_back(hc);
         }
 
-        ShmQueue<cmd_t>* q = new ShmQueue<cmd_t>();
+        ShmQueue<cmd_t>* q =
+            ShmQueue<cmd_t>::Create(cmd_queue_name(hc.hardware_mac).c_str(),
+                                    QUEUE_CAP);
         {
             std::lock_guard<std::mutex> lk(cmd_queues_mtx);
             cmd_queues[hc.hardware_mac] = q;
@@ -297,7 +325,7 @@ static void controller(int admin_fd) {
         }
 
         // Encolamos en la Cmd queue del device: lo tomará su Hardware Handler.
-        q->push(cmd);
+        q->Put(cmd);
     }
 
 done:
@@ -324,7 +352,7 @@ static void admin_connection_point(int listen_fd) {
 // ---------------------------------------------------------------------------
 static void msg_handler() {
     for (;;) {
-        Msg m = msg_queue.pop();  // Bloquea hasta que haya una respuesta.
+        Msg m = msg_queue->Get();  // Bloquea hasta que haya una respuesta.
 
         PendingCall pc{};
         bool found = false;
@@ -339,7 +367,7 @@ static void msg_handler() {
         }
         if (!found) continue;  // Respuesta huérfana (admin ya se fue).
 
-        write_cmd(pc.admin_fd, m.cmd, m.payload);
+        write_cmd(pc.admin_fd, m.cmd, std::string(m.payload, m.payload_len));
     }
 }
 
@@ -363,6 +391,8 @@ int main(int argc, char* argv[]) {
     int admin_listen = make_listener(admin_port);
     if (admin_listen < 0) error("ERROR listener admin");
 
+    msg_queue = ShmQueue<Msg>::Create(MSG_QUEUE_NAME, QUEUE_CAP);
+
     printf("[control] escuchando hardware:%d  admin:%d\n",
            hw_port, admin_port);
 
@@ -374,5 +404,6 @@ int main(int argc, char* argv[]) {
 
     close(hw_listen);
     close(admin_listen);
+    ShmQueue<Msg>::Destroy(MSG_QUEUE_NAME);
     return 0;
 }
