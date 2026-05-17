@@ -1,204 +1,378 @@
-/* A simple server in the internet domain using TCP
-   The port number is passed as an argument */
+/* ============================================================================
+ *  control_server.cpp  -  Servidor de Control (broker / proxy de paquetes)
+ *
+ *  Actúa de intermediario entre los clientes de Hardware (Red Pitaya) y los
+ *  clientes Admin. Estructura (ver diagramas de arquitectura):
+ *
+ *    - Connection Point : accept() de conexiones de hardware. Por cada device
+ *                         hace el handshake CTRL_HELLO, lo registra en la tabla
+ *                         y lanza un Hardware Handler con su Cmd Shm_Queue.
+ *
+ *    - Hardware Handler : 1 hilo por device. Saca comandos de su Cmd queue,
+ *                         los manda al hardware con write_cmd_and_wait_response
+ *                         (Request-Response bloqueante) y empuja la respuesta a
+ *                         la Msg queue. Maneja la desconexión del device.
+ *
+ *    - Controller       : 1 hilo por Admin. Lee comandos del Admin: CTRL_HELLO,
+ *                         CTRL_LIST_DEVICES, o comandos de API dirigidos a un
+ *                         device (los registra en unanswered_calls_table y los
+ *                         encola en la Cmd queue del device destino).
+ *
+ *    - Msg Handler      : saca de la Msg queue, busca en unanswered_calls_table
+ *                         el Admin que originó la llamada y le reenvía la
+ *                         respuesta.
+ *
+ *  Uso:  ./control_server <puerto_hardware> <puerto_admin>
+ * ========================================================================== */
 
-
-// El server de control de be ser un proxy de paquetes? Entiendo 
-// 
-
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/types.h> 
-#include <sys/socket.h>
-#include <netinet/in.h>
 
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include "api.cpp"
 #include "include/ShmQueue.h"
 
+// ---------------------------------------------------------------------------
+//  Estado global del Control
+// ---------------------------------------------------------------------------
 
+// Tabla de clientes de hardware conectados (hd_client_list).
+static std::vector<hardware_clients> hardware_client_table;
+static std::mutex hw_table_mtx;
 
+// Una Cmd Shm_Queue por device (clave = MAC del device).
+static std::map<device_mac, ShmQueue<cmd_t>*> cmd_queues;
+static std::mutex cmd_queues_mtx;
 
-List<hardware_clients> hardware_client_table;
+// Mensaje que viaja por la Msg queue desde un Hardware Handler al Msg Handler.
+struct Msg {
+    cmd_t       cmd;
+    std::string payload;
+};
+static ShmQueue<Msg> msg_queue;
 
+// Llamada pendiente de respuesta: request_id -> admin que la originó.
+struct PendingCall {
+    admin_id admin;
+    int      admin_fd;
+};
+static std::unordered_map<request_id, PendingCall> unanswered_calls_table;
+static std::mutex unanswered_mtx;
 
-// Request Hash table - Add to control
-unorderedmap<request_state, (request_id, admin_id)> unanswered_calls_table;
+// Admins conectados (para broadcast de eventos como CTRL_DEVICE_GONE).
+static std::map<admin_id, int> admin_fds;  // admin_id -> socket fd
+static std::mutex admin_fds_mtx;
 
+static std::atomic<int>      next_hardware_id{1};
+static std::atomic<admin_id> next_admin_id{1};
 
-void error(const char *msg)
-{
+void error(const char* msg) {
     perror(msg);
     exit(1);
 }
 
-int main(int argc, char *argv[])
-{
-     int sockfd, newsockfd, portno;
-     int pid;
-     socklen_t clilen;
-     char buffer[256];
-     int val = 1;
-     struct sockaddr_in serv_addr, cli_addr;
-     int n;
+// ---------------------------------------------------------------------------
+//  hardwareTable2String: serializa la tabla de devices para CTRL_LIST_DEVICES
+// ---------------------------------------------------------------------------
+static std::string hardwareTable2String() {
+    std::lock_guard<std::mutex> lk(hw_table_mtx);
+    std::string buf;
+    char line[256];
+    for (const auto& c : hardware_client_table) {
+        snprintf(line, sizeof(line),
+                 "id=%d mac=%012llx model=%d zynq=%d\n",
+                 c.hardware_id,
+                 (unsigned long long)c.hardware_mac,
+                 (int)c.model, (int)c.zynq_model);
+        buf += line;
+    }
+    if (buf.empty()) buf = "(no devices connected)\n";
+    return buf;
+}
 
+static void broadcast_to_admins(const cmd_t& ev, const std::string& pl = "") {
+    std::lock_guard<std::mutex> lk(admin_fds_mtx);
+    for (auto& [aid, fd] : admin_fds) {
+        (void)aid;
+        write_cmd(fd, ev, pl);
+    }
+}
 
-     if (argc < 2) {
-         fprintf(stderr,"ERROR, no port provided\n");
-         exit(1);
-     }
-     
-     // Creo socket
-     sockfd = socket(AF_INET, SOCK_STREAM, 0);
-     if (sockfd < 0) 
-        error("ERROR opening socket");
-     bzero((char *) &serv_addr, sizeof(serv_addr));
-     portno = atoi(argv[1]);
-     serv_addr.sin_family = AF_INET;
-     serv_addr.sin_addr.s_addr = INADDR_ANY;
-     serv_addr.sin_port = htons(portno);
+// ---------------------------------------------------------------------------
+//  Hardware Handler  (1 hilo por device)
+// ---------------------------------------------------------------------------
+static void hardware_handler(int hw_socket, device_mac mac,
+                             ShmQueue<cmd_t>* cmd_q) {
+    printf("[hw-handler] device %012llx: handler arrancado\n",
+           (unsigned long long)mac);
 
-     // Configuro Socket
-     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
-     if (bind(sockfd, (struct sockaddr *) &serv_addr,
-              sizeof(serv_addr)) < 0) 
-              error("ERROR on binding");
-     listen(sockfd,5);
-     clilen = sizeof(cli_addr);
-     
+    for (;;) {
+        // Bloquea hasta que el Controller encole un comando para este device.
+        cmd_t cmd = cmd_q->pop();
 
-     // Abro tantos sockets
-     while(newsockfd = accept(sockfd, 
-                 (struct sockaddr *) &cli_addr, 
-                 &clilen)){
+        // CTRL_BYE interno: el device se va, terminamos el handler.
+        if (cmd.header.api_id.family == API_CONTROL &&
+            cmd.header.api_id.function_id == CTRL_BYE) {
+            break;
+        }
 
-        if (newsockfd < 0) 
-        error("ERROR on accept");
-        pid = fork();
-        
-        // Acepto
-        if(pid){
-            // paddre, lo llevo a escuchar otro proceso 
-            newsockfd = NULL;
+        // Request-Response bloqueante contra el hardware.
+        cmd_t resp{};
+        std::string resp_pl;
+        bool ok = write_cmd_and_wait_response(hw_socket, cmd, &resp, &resp_pl);
+
+        if (!ok) {
+            // El device se cayó: notificamos como respuesta de error y salimos.
+            cmd_t gone = cmd;
+            gone.header.type = RESPONSE;
+            gone.body.retval = -1;
+            msg_queue.push({gone, "device disconnected\n"});
+            break;
+        }
+
+        // Empujamos la respuesta a la Msg queue para que el Msg Handler la
+        // rutee de vuelta al Admin que la pidió.
+        msg_queue.push({resp, std::move(resp_pl)});
+    }
+
+    // --- Limpieza: el device se fue ---
+    close(hw_socket);
+    {
+        std::lock_guard<std::mutex> lk(hw_table_mtx);
+        for (auto it = hardware_client_table.begin();
+             it != hardware_client_table.end(); ++it) {
+            if (it->hardware_mac == mac) {
+                hardware_client_table.erase(it);
+                break;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(cmd_queues_mtx);
+        auto it = cmd_queues.find(mac);
+        if (it != cmd_queues.end()) {
+            delete it->second;
+            cmd_queues.erase(it);
+        }
+    }
+    // Aviso a los Admins (EVENT, sin respuesta esperada).
+    cmd_t ev = make_cmd(API_CONTROL, CTRL_DEVICE_GONE, EVENT, mac);
+    broadcast_to_admins(ev);
+    printf("[hw-handler] device %012llx: desconectado\n",
+           (unsigned long long)mac);
+}
+
+// ---------------------------------------------------------------------------
+//  Connection Point  (accept de hardware)
+// ---------------------------------------------------------------------------
+static void connection_point(int listen_fd) {
+    struct sockaddr_in cli_addr;
+    socklen_t clilen = sizeof(cli_addr);
+
+    for (;;) {
+        int hw_fd = accept(listen_fd, (struct sockaddr*)&cli_addr, &clilen);
+        if (hw_fd < 0) continue;
+
+        // Handshake: esperamos CTRL_HELLO con los datos de la Pitaya.
+        cmd_t hello{};
+        if (!read_cmd(hw_fd, &hello, nullptr) ||
+            hello.header.api_id.family != API_CONTROL ||
+            hello.header.api_id.function_id != CTRL_HELLO) {
+            close(hw_fd);
             continue;
         }
-        
 
-        bzero(buffer,256);
-        n = read(newsockfd,buffer,255);
-        if (n < 0) error("ERROR reading from socket");
-        printf("Here is the message: %s\n",buffer);
-        n = write(newsockfd,"I got your message",18);
-        if (n < 0) error("ERROR writing to socket");
-        close(newsockfd);
+        hardware_clients hc{};
+        hc.hardware_mac = hello.body.destination_device;  // MAC en el body.
+        hc.hardware_id  = next_hardware_id++;
+        hc.socket_fd    = hw_fd;
+        hc.model        = (rp_HPeModels_t)hello.body.params.ii.a;
+        hc.zynq_model   = (rp_HPeZynqModels_t)hello.body.params.ii.b;
 
+        {
+            std::lock_guard<std::mutex> lk(hw_table_mtx);
+            hardware_client_table.push_back(hc);
         }
 
-     close(sockfd);
-     return 0; 
+        ShmQueue<cmd_t>* q = new ShmQueue<cmd_t>();
+        {
+            std::lock_guard<std::mutex> lk(cmd_queues_mtx);
+            cmd_queues[hc.hardware_mac] = q;
+        }
+
+        // Respondemos "aceptado" con el id asignado.
+        cmd_t ack = make_cmd(API_CONTROL, CTRL_HELLO, RESPONSE,
+                             hc.hardware_mac);
+        ack.body.retval = hc.hardware_id;
+        write_cmd(hw_fd, ack);
+
+        printf("[conn-point] device %012llx aceptado (id=%d)\n",
+               (unsigned long long)hc.hardware_mac, hc.hardware_id);
+
+        std::thread(hardware_handler, hw_fd, hc.hardware_mac, q).detach();
+    }
 }
 
+// ---------------------------------------------------------------------------
+//  Controller  (1 hilo por Admin)
+// ---------------------------------------------------------------------------
+static std::atomic<request_id> next_request_id{1};
 
+static void controller(int admin_fd) {
+    admin_id my_admin = 0;
 
-//// Unir con este código
-/*
+    for (;;) {
+        cmd_t cmd{};
+        std::string pl;
+        if (!read_cmd(admin_fd, &cmd, &pl)) break;  // Admin se desconectó.
 
-const char[] hardwareTable2String(List<hardware_clients> * hardware_client_table){
-	for(auto start = Iterator::List<hardware_clients>(hardware_client_table); start++; start!=end.hardware_client_table)
-		string buf;
-		
-		// Strcture hardware_clients atributes
-		return buf.to_c_string;
+        if (cmd.header.api_id.family == API_CONTROL) {
+            switch (cmd.header.api_id.function_id) {
+                case CTRL_HELLO: {
+                    my_admin = next_admin_id++;
+                    {
+                        std::lock_guard<std::mutex> lk(admin_fds_mtx);
+                        admin_fds[my_admin] = admin_fd;
+                    }
+                    cmd_t r = make_cmd(API_CONTROL, CTRL_HELLO, RESPONSE);
+                    r.body.request_id = cmd.body.request_id;
+                    r.body.origin_admin = my_admin;
+                    r.body.retval = (int32_t)my_admin;
+                    write_cmd(admin_fd, r);
+                    printf("[controller] admin conectado (id=%u)\n", my_admin);
+                    break;
+                }
+                case CTRL_LIST_DEVICES: {
+                    std::string list = hardwareTable2String();
+                    cmd_t r = make_cmd(API_CONTROL, CTRL_LIST_DEVICES,
+                                       RESPONSE);
+                    r.body.request_id = cmd.body.request_id;
+                    r.body.origin_admin = my_admin;
+                    write_cmd(admin_fd, r, list);
+                    break;
+                }
+                case CTRL_BYE: {
+                    goto done;
+                }
+                default:
+                    break;
+            }
+            continue;
+        }
+
+        // --- Comando de API dirigido a un device concreto ---
+        request_id rid = next_request_id++;
+        cmd.body.request_id = rid;
+        cmd.body.origin_admin = my_admin;
+
+        {
+            std::lock_guard<std::mutex> lk(unanswered_mtx);
+            unanswered_calls_table[rid] = PendingCall{my_admin, admin_fd};
+        }
+
+        ShmQueue<cmd_t>* q = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(cmd_queues_mtx);
+            auto it = cmd_queues.find(cmd.body.destination_device);
+            if (it != cmd_queues.end()) q = it->second;
+        }
+
+        if (!q) {
+            // Device inexistente: respondemos error directo al Admin.
+            std::lock_guard<std::mutex> lk(unanswered_mtx);
+            unanswered_calls_table.erase(rid);
+            cmd_t r = cmd;
+            r.header.type = RESPONSE;
+            r.body.retval = -1;
+            write_cmd(admin_fd, r, "unknown device\n");
+            continue;
+        }
+
+        // Encolamos en la Cmd queue del device: lo tomará su Hardware Handler.
+        q->push(cmd);
+    }
+
+done:
+    {
+        std::lock_guard<std::mutex> lk(admin_fds_mtx);
+        if (my_admin) admin_fds.erase(my_admin);
+    }
+    close(admin_fd);
+    printf("[controller] admin %u desconectado\n", my_admin);
 }
 
-
-// Creería que tiene que ser una función del tipo void *
-void * hardware_handler(<hardware_client_socket>, Shm_Queue* shared_que){
-	ShmQueue<cmd>
-	
-	// Connect to socket
-	connect(hardware_client_socket)
-	
-	while(1)
-		while(res = read(hardware_client_socket)> until <cmd_completion>{
-			cmd.add(res)
-		}
-		
-		while(res = white(hardware_client_socket)){
-		
-		}
+static void admin_connection_point(int listen_fd) {
+    struct sockaddr_in cli_addr;
+    socklen_t clilen = sizeof(cli_addr);
+    for (;;) {
+        int fd = accept(listen_fd, (struct sockaddr*)&cli_addr, &clilen);
+        if (fd < 0) continue;
+        std::thread(controller, fd).detach();
+    }
 }
 
+// ---------------------------------------------------------------------------
+//  Msg Handler
+// ---------------------------------------------------------------------------
+static void msg_handler() {
+    for (;;) {
+        Msg m = msg_queue.pop();  // Bloquea hasta que haya una respuesta.
 
-// Receiving Thread
-res = read(<message_socket>)
-if(cmd.header.api_id.family = API_CONTROL){
-	// Trabajo sobre los comandos de control
-	if(cmd.header.api_id.minor = HELLO){
-		thread{hardware_handler()}
-	}
-}else{ // Command packet
-	// Create hardware packet from 
-	unanswered_calls_table.add(cmd.body.cmd_id)
+        PendingCall pc{};
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(unanswered_mtx);
+            auto it = unanswered_calls_table.find(m.cmd.body.request_id);
+            if (it != unanswered_calls_table.end()) {
+                pc = it->second;
+                found = true;
+                unanswered_calls_table.erase(it);
+            }
+        }
+        if (!found) continue;  // Respuesta huérfana (admin ya se fue).
+
+        write_cmd(pc.admin_fd, m.cmd, m.payload);
+    }
 }
 
+// ---------------------------------------------------------------------------
+//  main
+// ---------------------------------------------------------------------------
+int main(int argc, char* argv[]) {
+    if (argc < 3) {
+        fprintf(stderr,
+                "Uso: %s <puerto_hardware> <puerto_admin>\n", argv[0]);
+        exit(1);
+    }
 
+    signal(SIGPIPE, SIG_IGN);  // write() a socket cerrado no debe matarnos.
 
-if(cmd.header.type= RESPONSE) // Response/Request{
-	// Tipo de resultado
-	res= unanswered_calls_table.delete(cmd.body.cmd_id)
+    int hw_port    = atoi(argv[1]);
+    int admin_port = atoi(argv[2]);
+
+    int hw_listen = make_listener(hw_port);
+    if (hw_listen < 0) error("ERROR listener hardware");
+    int admin_listen = make_listener(admin_port);
+    if (admin_listen < 0) error("ERROR listener admin");
+
+    printf("[control] escuchando hardware:%d  admin:%d\n",
+           hw_port, admin_port);
+
+    std::thread(msg_handler).detach();
+    std::thread(admin_connection_point, admin_listen).detach();
+
+    // El hilo principal se queda como Connection Point de hardware.
+    connection_point(hw_listen);
+
+    close(hw_listen);
+    close(admin_listen);
+    return 0;
 }
-
-struct Admin_client{
-	uint32_t admin_id: // Ipv4?
-	
-}
-
-unordered_map<Shd_queue, device_id> Cmd_queues;
-List<Admin> admin_list;
-
-// Controller Thread
-cmd = read(<message_socket>)
-switch(cmd.Header.family){
-	case(CONTROL)
-		// Ver que hacer con cada uno de las 
-		switch(cmd.header.api_id.minor)
-			case(CTRL_HELLO)
-				// Add to Admin Table 
-				// Check if request
-	
-				if(cmd.Header.type = REQUEST) {
-					// Extract Body
-					Admin adm_temp = admin_from_boby(cmd.Header.Body);
-					admin_list.append(adm_temp);
-				}
-				
-			case(CTRL_LIST_DEVICES)
-				// Pass device list 
-				char[] buff = hardwareTable2String()
-				
-				cmd_ListDevices= {
-					{VERSION, 
-					API_CONTROL,
-					LIST_DEVICES,
-					RESPONSE
-					} //
-					,
-					{buff}
-				}
-				write
-				
-			case(CTRL_DEVICE_GONE)
-				// Delete device from table
-				device_refered = cmd.Body.device_id
-				hardware_client_table.delete(device_refered)
-			case(STD_OUTDEVICE)
-				// Pass packet to Admin 
-				write(<Admin>)
-	case()
-	// Rest of funtions
-}
-
-
-
-
-*/
