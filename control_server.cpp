@@ -13,6 +13,17 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#include "include/ShmQueue.h"
+
+
+
+
+List<hardware_clients> hardware_client_table;
+
+
+// Request Hash table - Add to control
+unorderedmap<request_state, (request_id, admin_id)> unanswered_calls_table;
+
 
 void error(const char *msg)
 {
@@ -85,3 +96,109 @@ int main(int argc, char *argv[])
      close(sockfd);
      return 0; 
 }
+
+
+
+//// Unir con este código
+/*
+
+const char[] hardwareTable2String(List<hardware_clients> * hardware_client_table){
+	for(auto start = Iterator::List<hardware_clients>(hardware_client_table); start++; start!=end.hardware_client_table)
+		string buf;
+		
+		// Strcture hardware_clients atributes
+		return buf.to_c_string;
+}
+
+
+// Creería que tiene que ser una función del tipo void *
+void * hardware_handler(<hardware_client_socket>, Shm_Queue* shared_que){
+	ShmQueue<cmd>
+	
+	// Connect to socket
+	connect(hardware_client_socket)
+	
+	while(1)
+		while(res = read(hardware_client_socket)> until <cmd_completion>{
+			cmd.add(res)
+		}
+		
+		while(res = white(hardware_client_socket)){
+		
+		}
+}
+
+
+// Receiving Thread
+res = read(<message_socket>)
+if(cmd.header.api_id.family = API_CONTROL){
+	// Trabajo sobre los comandos de control
+	if(cmd.header.api_id.minor = HELLO){
+		thread{hardware_handler()}
+	}
+}else{ // Command packet
+	// Create hardware packet from 
+	unanswered_calls_table.add(cmd.body.cmd_id)
+}
+
+
+
+if(cmd.header.type= RESPONSE) // Response/Request{
+	// Tipo de resultado
+	res= unanswered_calls_table.delete(cmd.body.cmd_id)
+}
+
+struct Admin_client{
+	uint32_t admin_id: // Ipv4?
+	
+}
+
+unordered_map<Shd_queue, device_id> Cmd_queues;
+List<Admin> admin_list;
+
+// Controller Thread
+cmd = read(<message_socket>)
+switch(cmd.Header.family){
+	case(CONTROL)
+		// Ver que hacer con cada uno de las 
+		switch(cmd.header.api_id.minor)
+			case(CTRL_HELLO)
+				// Add to Admin Table 
+				// Check if request
+	
+				if(cmd.Header.type = REQUEST) {
+					// Extract Body
+					Admin adm_temp = admin_from_boby(cmd.Header.Body);
+					admin_list.append(adm_temp);
+				}
+				
+			case(CTRL_LIST_DEVICES)
+				// Pass device list 
+				char[] buff = hardwareTable2String()
+				
+				cmd_ListDevices= {
+					{VERSION, 
+					API_CONTROL,
+					LIST_DEVICES,
+					RESPONSE
+					} //
+					,
+					{buff}
+				}
+				write
+				
+			case(CTRL_DEVICE_GONE)
+				// Delete device from table
+				device_refered = cmd.Body.device_id
+				hardware_client_table.delete(device_refered)
+			case(STD_OUTDEVICE)
+				// Pass packet to Admin 
+				write(<Admin>)
+	case()
+	// Rest of funtions
+}
+
+
+
+
+*/
