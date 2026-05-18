@@ -58,6 +58,31 @@ static std::mutex hw_table_mtx;
 // además de Put() en la cola, escribe 1 byte en `notify_w`. El Hardware
 // Handler hace select() sobre el socket del device y el extremo de lectura
 // del pipe, para no quedar ciego al socket mientras espera comandos.
+//
+//                         ===  DEVICE CHANNEL  ===
+//
+//   Controller (1 hilo x Admin)                 Hardware Handler (1 hilo)
+//   ---------------------------                 ------------------------
+//          |                                          |
+//          | (1) Put(cmd)                             |
+//          v                                          |
+//     +-----------------+   Get(cmd)   .------> select( notify_r , hw_socket )
+//     |  Cmd Shm_Queue  |------------->|          |              |
+//     |  (POSIX shm +   |              |          |              |
+//     |   semáforos)    |              |   notify_r readable     hw_socket
+//     +-----------------+              |   => drena pipe         readable
+//          ^                           |      1 byte == 1 cmd    => EVENT no
+//          | (2) write 1 byte          |   => Get() + Request-      solicitado
+//          v                           |      Response al device   (STD_OUT)
+//     +-----------------+   read()     |                           o cierre
+//     |  self-pipe      |--------------'                           (DEVICE
+//     | notify_w-->notify_r |                                       GONE)
+//     +-----------------+
+//
+//   (1) y (2) en ESE orden: cuando el Handler ve el byte, el cmd ya está
+//   encolado, así Get() nunca bloquea. El select() multiplexa las dos
+//   llamadas bloqueantes (cola de comandos y socket) para no perder ni
+//   un EVENT ni la caída del device en ningún momento.
 struct DeviceChannel {
     ShmQueue<cmd_t>* cmd_q;
     int              notify_w;  // Extremo de escritura del self-pipe.

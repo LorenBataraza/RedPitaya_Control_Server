@@ -1,4 +1,3 @@
-control_server
-hardware_client
-admin_client
+build/
+out/
 *.o
