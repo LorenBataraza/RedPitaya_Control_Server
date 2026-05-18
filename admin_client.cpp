@@ -37,6 +37,7 @@ static void messageReader() {
             std::cerr << "[admin] conexión con Control cerrada\n";
             return;
         }
+        dbg_cmd("admin<-ctrl", cmd, pl);
 
         if (cmd.header.type == EVENT &&
             cmd.header.api_id.family == API_CONTROL &&
@@ -84,24 +85,30 @@ int main(int argc, char* argv[]) {
 
     std::atomic<request_id> rid{1};
 
+    // Loguea (modo debug) y manda el comando.
+    auto send = [](const cmd_t& c) {
+        dbg_cmd("admin->ctrl", c);
+        write_cmd(g_socket, c);
+    };
+
     // CTRL_HELLO
     cmd_t hello = make_cmd(API_CONTROL, CTRL_HELLO, REQUEST);
     hello.body.request_id = rid++;
-    write_cmd(g_socket, hello);
+    send(hello);
 
     // CTRL_LIST_DEVICES
     cmd_t list = make_cmd(API_CONTROL, CTRL_LIST_DEVICES, REQUEST);
     list.body.request_id = rid++;
-    write_cmd(g_socket, list);
+    send(list);
 
     // Ejemplo: rp_Init() y rp_GetVersion() en el device `target`.
     cmd_t init = make_cmd(API_SYSTEM, SYS_INIT, REQUEST, target);
     init.body.request_id = rid++;
-    write_cmd(g_socket, init);
+    send(init);
 
     cmd_t ver = make_cmd(API_SYSTEM, SYS_GET_VERSION, REQUEST, target);
     ver.body.request_id = rid++;
-    write_cmd(g_socket, ver);
+    send(ver);
 
     // Lectura interactiva opcional: cada línea reenvía CTRL_LIST_DEVICES.
     std::string line;
@@ -109,11 +116,11 @@ int main(int argc, char* argv[]) {
         if (line == "quit") break;
         cmd_t l = make_cmd(API_CONTROL, CTRL_LIST_DEVICES, REQUEST);
         l.body.request_id = rid++;
-        write_cmd(g_socket, l);
+        send(l);
     }
 
     cmd_t bye = make_cmd(API_CONTROL, CTRL_BYE, EVENT);
-    write_cmd(g_socket, bye);
+    send(bye);
     close(g_socket);
     return 0;
 }

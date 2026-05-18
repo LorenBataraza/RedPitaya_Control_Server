@@ -339,6 +339,7 @@ static void controller(int admin_fd) {
         cmd_t cmd{};
         std::string pl;
         if (!read_cmd(admin_fd, &cmd, &pl)) break;  // Admin se desconectó.
+        dbg_cmd("ctrl<-admin", cmd, pl);
 
         if (cmd.header.api_id.family == API_CONTROL) {
             switch (cmd.header.api_id.function_id) {
@@ -352,6 +353,7 @@ static void controller(int admin_fd) {
                     r.body.request_id = cmd.body.request_id;
                     r.body.origin_admin = my_admin;
                     r.body.retval = (int32_t)my_admin;
+                    dbg_cmd("ctrl->admin", r);
                     write_cmd(admin_fd, r);
                     printf("[controller] admin conectado (id=%u)\n", my_admin);
                     break;
@@ -362,6 +364,7 @@ static void controller(int admin_fd) {
                                        RESPONSE);
                     r.body.request_id = cmd.body.request_id;
                     r.body.origin_admin = my_admin;
+                    dbg_cmd("ctrl->admin", r, list);
                     write_cmd(admin_fd, r, list);
                     break;
                 }
@@ -402,6 +405,7 @@ static void controller(int admin_fd) {
             cmd_t r = cmd;
             r.header.type = RESPONSE;
             r.body.retval = -1;
+            dbg_cmd("ctrl->admin", r, "unknown device");
             write_cmd(admin_fd, r, "unknown device\n");
             continue;
         }
@@ -409,6 +413,7 @@ static void controller(int admin_fd) {
         // Encolamos en la Cmd queue del device y despertamos su select()
         // con 1 byte en el self-pipe (Put antes que el byte: cuando el
         // Handler ve el byte, el elemento ya está en la cola).
+        dbg_cmd("ctrl->device", cmd);
         q->Put(cmd);
         const char tick = 1;
         ssize_t wn = write(notify_w, &tick, 1);
@@ -454,7 +459,9 @@ static void msg_handler() {
         }
         if (!found) continue;  // Respuesta huérfana (admin ya se fue).
 
-        write_cmd(pc.admin_fd, m.cmd, std::string(m.payload, m.payload_len));
+        std::string mp(m.payload, m.payload_len);
+        dbg_cmd("ctrl->admin", m.cmd, mp);
+        write_cmd(pc.admin_fd, m.cmd, mp);
     }
 }
 

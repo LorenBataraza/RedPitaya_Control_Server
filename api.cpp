@@ -26,6 +26,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -280,4 +282,65 @@ inline cmd_t make_cmd(api_family family, uint16_t fn, flag type,
     c.body.origin_admin = origin;
     c.body.retval = 0;
     return c;
+}
+
+// ============================================================================
+//  Modo debug  -  activar con la variable de entorno  RPCS_DEBUG=1
+//
+//  dbg_cmd() imprime por stderr un resumen de cada cmd_t que pasa por un
+//  punto instrumentado (Controller y Admin). Se usa stderr para no mezclarlo
+//  con el stdout "útil" (lista de devices, salida reenviada del programa).
+// ============================================================================
+
+inline bool dbg_enabled() {
+    static int e = -1;
+    if (e < 0) {
+        const char* v = getenv("RPCS_DEBUG");
+        e = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return e == 1;
+}
+
+inline const char* dbg_family_name(uint16_t f) {
+    switch (f) {
+        case API_CONTROL:     return "CONTROL";
+        case API_SYSTEM:      return "SYSTEM";
+        case API_ACQUISITION: return "ACQ";
+        case API_GENERATION:  return "GEN";
+        case API_DIGITAL_IO:  return "DIO";
+        case API_ANALOG_IO:   return "AIO";
+        default:              return "?";
+    }
+}
+
+inline const char* dbg_flag_name(uint8_t t) {
+    switch (t) {
+        case REQUEST:  return "REQUEST";
+        case RESPONSE: return "RESPONSE";
+        case EVENT:    return "EVENT";
+        default:       return "?";
+    }
+}
+
+inline void dbg_cmd(const char* tag, const cmd_t& c,
+                    const std::string& payload = "") {
+    if (!dbg_enabled()) return;
+    fprintf(stderr,
+            "[DBG %-14s] fam=%-7s fn=%u type=%-8s dev=%012llx "
+            "rid=%u admin=%u ret=%d plen=%u",
+            tag,
+            dbg_family_name(c.header.api_id.family),
+            (unsigned)c.header.api_id.function_id,
+            dbg_flag_name(c.header.type),
+            (unsigned long long)c.body.destination_device,
+            (unsigned)c.body.request_id,
+            (unsigned)c.body.origin_admin,
+            (int)c.body.retval,
+            (unsigned)c.header.payload_size);
+    if (!payload.empty()) {
+        std::string p = payload;
+        for (char& ch : p) if (ch == '\n') ch = ' ';
+        fprintf(stderr, " payload=\"%s\"", p.c_str());
+    }
+    fprintf(stderr, "\n");
 }
