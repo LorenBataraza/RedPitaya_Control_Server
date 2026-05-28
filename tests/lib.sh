@@ -34,6 +34,7 @@ wait_port() {
     return 1
 }
 
+
 pass_fail() {  # pass_fail <archivo> <patron> <descripcion>
     if grep -qi -- "$2" "$1"; then
         echo "  OK   - $3"

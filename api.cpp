@@ -3,15 +3,11 @@
 // ============================================================================
 //  api.cpp  -  Protocolo de control remoto de Red Pitaya + helpers de socket
 //
-//  Este archivo se #include-a desde control_server.cpp, hardware_client.cpp y
-//  admin_client.cpp. Cada uno de ellos es un ejecutable independiente (una
+//  Cada uno de ellos es un ejecutable independiente (una
 //  única unidad de traducción), por lo que las funciones se definen aquí
-//  directamente. Aun así se marcan `inline` para evitar problemas si en el
-//  futuro se incluye desde más de un .cpp del mismo binario.
+//  directamente. 
 //
 //  Formato de un mensaje en el cable (todo packed, little-endian del host):
-//
-//      [ header_t ][ body_t ][ payload  (header.payload_size bytes) ]
 //
 //  El payload es texto opcional de longitud variable: se usa para la lista de
 //  dispositivos (CTRL_LIST_DEVICES) y para el stdout reenviado (STD_OUTDEVICE).
@@ -50,10 +46,11 @@ struct hardware_clients {
 enum api_family : uint16_t {
     API_CONTROL     = 0,  // mensajes del propio protocolo
     API_SYSTEM      = 1,  // rp_Init, rp_Release, rp_GetVersion
-    API_ACQUISITION = 2,  // rp_Acq*
+    API_ACQUISITION = 2,  // rp_Acq*  (osciloscopio)
     API_GENERATION  = 3,  // rp_Gen*
     API_DIGITAL_IO  = 4,  // rp_Dpin*
     API_ANALOG_IO   = 5,  // rp_Apin*
+    API_HW_PROFILE  = 6,  // hp_cmn_Print: dump del profile del board
 };
 
 // Minor para los mensajes de control.
@@ -72,6 +69,21 @@ enum system_fn : uint16_t {
     SYS_RELEASE,
     SYS_RESET,
     SYS_GET_VERSION,
+};
+
+// Minor para API_ACQUISITION (oscilloscope.cpp en la RP API).
+enum acquisition_fn : uint16_t {
+    ACQ_PRINT_REGSET = 0,  // -> osc_printRegset()
+};
+
+// Minor para API_GENERATION.
+enum generation_fn : uint16_t {
+    GEN_PRINT_REGSET = 0,  // -> generate_printRegset()
+};
+
+// Minor para API_HW_PROFILE.
+enum hw_profile_fn : uint16_t {
+    HWP_PRINT = 0,         // -> hp_cmn_Print(getProfileDefault())
 };
 
 enum flag : uint8_t {
@@ -125,7 +137,7 @@ inline bool read_all(int fd, void* buf, size_t n) {
     auto* p = static_cast<uint8_t*>(buf);
     size_t got = 0;
     while (got < n) {
-        ssize_t r = read(fd, p + got, n - got);
+        ssize_t r = read(fd, p + got, n - got); // ssize porque puede ser pequeno
         if (r == 0) return false;            // peer cerró.
         if (r < 0) {
             if (errno == EINTR) continue;
@@ -167,9 +179,11 @@ inline bool read_cmd(int fd, cmd_t* out, std::string* payload = nullptr) {
     return true;
 }
 
-// Escribe un comando completo. Ajusta payload_size según el texto pasado.
+// Escribe un comando completo
 inline bool write_cmd(int fd, cmd_t cmd, const std::string& payload = "") {
+    // 
     cmd.header.payload_size = static_cast<uint32_t>(payload.size());
+
     if (!write_all(fd, &cmd.header, sizeof(cmd.header))) return false;
     if (!write_all(fd, &cmd.body, sizeof(cmd.body))) return false;
     if (!payload.empty() && !write_all(fd, payload.data(), payload.size()))
@@ -182,19 +196,24 @@ inline bool write_cmd(int fd, cmd_t cmd, const std::string& payload = "") {
 //
 //  La usa el Hardware Handler del Control para hablar con el cliente de
 //  hardware: escribe el comando y se queda esperando la RESPONSE que
-//  corresponde a ese request_id. Mensajes EVENT entrantes (ej. STD_OUTDEVICE
-//  no solicitado) se entregan vía `on_event` y se siguen esperando.
+//  corresponde a ese request_id. 
+//
+//  Mensajes EVENT entrantes (ej. STD_OUTDEVICE no solicitado) se entregan vía `on_event` y se siguen esperando.
 //
 //  Devuelve true si llegó la respuesta, false ante error de socket.
 // ----------------------------------------------------------------------------
+
 inline bool write_cmd_and_wait_response(
     int fd,
     const cmd_t& request,
     cmd_t* response,
     std::string* response_payload = nullptr,
     const std::string& request_payload = "",
+    
+    // función callback para llamar cuando tenemos un evento
     void (*on_event)(const cmd_t&, const std::string&) = nullptr) {
 
+    // único punto de flla, escritura total del 
     if (!write_cmd(fd, request, request_payload)) return false;
 
     for (;;) {
@@ -207,14 +226,13 @@ inline bool write_cmd_and_wait_response(
             continue;  // No es la respuesta: seguimos esperando.
         }
 
-        // Aceptamos la respuesta correlando por request_id.
+        // Aceptamos la respuesta viendo el request_id.
         if (in.header.type == RESPONSE &&
             in.body.request_id == request.body.request_id) {
             *response = in;
             if (response_payload) *response_payload = std::move(pl);
             return true;
         }
-        // Respuesta descolgada / fuera de orden: la ignoramos.
     }
 }
 
@@ -222,7 +240,7 @@ inline bool write_cmd_and_wait_response(
 //  Helpers de conexión (al estilo de control_server.cpp: sockaddr_in, etc.)
 // ============================================================================
 
-// Crea un socket de escucha TCP enlazado a `port`. Devuelve fd o -1.
+// Crea un socket de escucha TCP enlazado a `port` (para servers). Devuelve fd o -1.
 inline int make_listener(int port, int backlog = 16) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -244,7 +262,7 @@ inline int make_listener(int port, int backlog = 16) {
     return fd;
 }
 
-// Conecta a `ip:port` por TCP. Devuelve fd o -1.
+// Conecta a `ip:port` por TCP (para clientes). Devuelve fd o -1.
 inline int connect_to(const char* ip, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -285,22 +303,41 @@ inline cmd_t make_cmd(api_family family, uint16_t fn, flag type,
 }
 
 // ============================================================================
-//  Modo debug  -  activar con la variable de entorno  RPCS_DEBUG=1
+//  Modo debug  -  activar con la flag de línea de comandos `-v` (verbose)
 //
 //  dbg_cmd() imprime por stderr un resumen de cada cmd_t que pasa por un
 //  punto instrumentado (Controller y Admin). Se usa stderr para no mezclarlo
 //  con el stdout "útil" (lista de devices, salida reenviada del programa).
+//
+//  Cada ejecutable hace al principio de main():
+//      bool verbose = extract_flag(&argc, argv, "-v");
+//      dbg_set_enabled(verbose);
 // ============================================================================
 
-inline bool dbg_enabled() {
-    static int e = -1;
-    if (e < 0) {
-        const char* v = getenv("RPCS_DEBUG");
-        e = (v && v[0] && v[0] != '0') ? 1 : 0;
+// Variable inline (C++17): una sola copia compartida entre TUs.
+inline bool g_dbg_enabled = false;
+
+inline bool dbg_enabled()            { return g_dbg_enabled; }
+inline void dbg_set_enabled(bool on) { g_dbg_enabled = on;   }
+
+// Busca y elimina apariciones de `flag` en argv (compactando). Devuelve true
+// si encontró al menos una. Sirve para soportar `-v` sin romper el orden de
+// los argumentos posicionales.
+inline bool extract_flag(int* argc, char** argv, const char* flag) {
+    bool found = false;
+    for (int i = 1; i < *argc; ) {
+        if (strcmp(argv[i], flag) == 0) {
+            for (int j = i; j + 1 < *argc; ++j) argv[j] = argv[j + 1];
+            (*argc)--;
+            found = true;
+        } else {
+            ++i;
+        }
     }
-    return e == 1;
+    return found;
 }
 
+// Función que devuelve el family name como char[]
 inline const char* dbg_family_name(uint16_t f) {
     switch (f) {
         case API_CONTROL:     return "CONTROL";
@@ -309,10 +346,12 @@ inline const char* dbg_family_name(uint16_t f) {
         case API_GENERATION:  return "GEN";
         case API_DIGITAL_IO:  return "DIO";
         case API_ANALOG_IO:   return "AIO";
+        case API_HW_PROFILE:  return "HWPROF";
         default:              return "?";
     }
 }
 
+// Función que devuelve la flag como char[]
 inline const char* dbg_flag_name(uint8_t t) {
     switch (t) {
         case REQUEST:  return "REQUEST";
@@ -322,6 +361,7 @@ inline const char* dbg_flag_name(uint8_t t) {
     }
 }
 
+// Función con la que 
 inline void dbg_cmd(const char* tag, const cmd_t& c,
                     const std::string& payload = "") {
     if (!dbg_enabled()) return;

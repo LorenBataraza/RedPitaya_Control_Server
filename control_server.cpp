@@ -46,53 +46,20 @@
 // ---------------------------------------------------------------------------
 //  Estado global del Control
 // ---------------------------------------------------------------------------
-
-// Tabla de clientes de hardware conectados (hd_client_list).
-// std::list: erase O(1) por iterador y no invalida referencias a otros
-// elementos cuando un device se desconecta (a diferencia de vector).
 static std::list<hardware_clients> hardware_client_table;
 static std::mutex hw_table_mtx;
 
-// Una Cmd Shm_Queue por device + un self-pipe de notificación.
-// El semáforo de la ShmQueue no es select()-able, así que el Controller,
-// además de Put() en la cola, escribe 1 byte en `notify_w`. El Hardware
-// Handler hace select() sobre el socket del device y el extremo de lectura
-// del pipe, para no quedar ciego al socket mientras espera comandos.
-//
-//                         ===  DEVICE CHANNEL  ===
-//
-//   Controller (1 hilo x Admin)                 Hardware Handler (1 hilo)
-//   ---------------------------                 ------------------------
-//          |                                          |
-//          | (1) Put(cmd)                             |
-//          v                                          |
-//     +-----------------+   Get(cmd)   .------> select( notify_r , hw_socket )
-//     |  Cmd Shm_Queue  |------------->|          |              |
-//     |  (POSIX shm +   |              |          |              |
-//     |   semáforos)    |              |   notify_r readable     hw_socket
-//     +-----------------+              |   => drena pipe         readable
-//          ^                           |      1 byte == 1 cmd    => EVENT no
-//          | (2) write 1 byte          |   => Get() + Request-      solicitado
-//          v                           |      Response al device   (STD_OUT)
-//     +-----------------+   read()     |                           o cierre
-//     |  self-pipe      |--------------'                           (DEVICE
-//     | notify_w-->notify_r |                                       GONE)
-//     +-----------------+
-//
-//   (1) y (2) en ESE orden: cuando el Handler ve el byte, el cmd ya está
-//   encolado, así Get() nunca bloquea. El select() multiplexa las dos
-//   llamadas bloqueantes (cola de comandos y socket) para no perder ni
-//   un EVENT ni la caída del device en ningún momento.
+// El device Channel es un estructura que hice para
+// poder hacer select(). el semáforo no es selectable.
 struct DeviceChannel {
     ShmQueue<cmd_t>* cmd_q;
     int              notify_w;  // Extremo de escritura del self-pipe.
 };
-static std::map<device_mac, DeviceChannel> cmd_queues;
+static std::map<device_mac, DeviceChannel> cmd_queues; // Mapeo queues a partir de la mac
 static std::mutex cmd_queues_mtx;
 
 // Mensaje que viaja por la Msg queue desde un Hardware Handler al Msg Handler.
-// POD (vive en memoria compartida): el payload va en buffer de tamaño fijo.
-static const size_t MSG_PAYLOAD_MAX = 1024;
+static const size_t MSG_PAYLOAD_MAX = 65536;   // dumps de osc_printRegset() superan 1 KB
 struct Msg {
     cmd_t    cmd;
     uint32_t payload_len;
@@ -122,18 +89,23 @@ static void push_msg(const cmd_t &cmd, const std::string &payload) {
     msg_queue->Put(m);
 }
 
-// Llamada pendiente de respuesta: request_id -> admin que la originó.
+// Llamada pendiente de respuesta: request_id (lado server) -> admin que la
+// originó + el request_id original que mandó el admin. Cuando vuelva la
+// response del device la rewriteamos al rid del admin antes de reenviarla.
 struct PendingCall {
-    admin_id admin;
-    int      admin_fd;
+    admin_id   admin;
+    int        admin_fd;
+    request_id admin_request_id;  // rid original del Admin
 };
-static std::unordered_map<request_id, PendingCall> unanswered_calls_table;
+
+static std::unordered_map<request_id, PendingCall> unanswered_calls_table; // Mismo que 
 static std::mutex unanswered_mtx;
 
 // Admins conectados (para broadcast de eventos como CTRL_DEVICE_GONE).
 static std::map<admin_id, int> admin_fds;  // admin_id -> socket fd
 static std::mutex admin_fds_mtx;
 
+// Variables para asignar id de hardware y admin.
 static std::atomic<int>      next_hardware_id{1};
 static std::atomic<admin_id> next_admin_id{1};
 
@@ -161,6 +133,7 @@ static std::string hardwareTable2String() {
     return buf;
 }
 
+// Funciones Auxiliares para el manejo de eventos. 
 static void broadcast_to_admins(const cmd_t& ev, const std::string& pl = "") {
     std::lock_guard<std::mutex> lk(admin_fds_mtx);
     for (auto& [aid, fd] : admin_fds) {
@@ -169,12 +142,11 @@ static void broadcast_to_admins(const cmd_t& ev, const std::string& pl = "") {
     }
 }
 
-// EVENT no solicitado emitido por el device (ej. STD_OUTDEVICE): se reenvía
-// a los Admins. Lo invoca tanto el select() del handler como, durante una
-// llamada Request-Response, write_cmd_and_wait_response() vía callback.
+// EVENT no solicitado emitido por el device (ej. STD_OUTDEVICE).
 static void on_hw_event(const cmd_t& ev, const std::string& pl) {
     broadcast_to_admins(ev, pl);
 }
+
 
 // ---------------------------------------------------------------------------
 //  Hardware Handler  (1 hilo por device)
@@ -185,21 +157,28 @@ static void hardware_handler(int hw_socket, device_mac mac,
     printf("[hw-handler] device %012llx: handler arrancado\n",
            (unsigned long long)mac);
 
-    // Extremo de lectura del self-pipe en no-bloqueante: lo drenamos entero.
+    // Extremo de lectura del self-pipe en no-bloqueante: lo limpiamos antes de utilizarlo 
     fcntl(notify_r, F_SETFL, O_NONBLOCK);
 
-    bool device_gone = false;
+    // Indica cuando perdimos el dispositivo
+    // Lo perdemos cuando 
+    // Tenemos un error sobre el select()
+    // Tenemos error sobre la lectrua de la respuesta
+    // Tenemos un Bye
+    bool device_gone = false; 
+
 
     while (!device_gone) {
-        // --- select() sobre AMBAS fuentes bloqueantes -------------------
+        // --- Único  select() sobre AMBAS fuentes bloqueantes -------------------
         // notify_r : el Controller encoló comando(s) en la Cmd queue.
         // hw_socket: el device mandó algo no solicitado (EVENT) o se cayó.
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(hw_socket, &rfds);
         FD_SET(notify_r, &rfds);
-        int maxfd = (hw_socket > notify_r ? hw_socket : notify_r) + 1;
 
+        // Lo necesito para select
+        int maxfd = (hw_socket > notify_r ? hw_socket : notify_r) + 1;
         int s = select(maxfd, &rfds, nullptr, nullptr, nullptr);
         if (s < 0) {
             if (errno == EINTR) continue;
@@ -213,6 +192,7 @@ static void hardware_handler(int hw_socket, device_mac mac,
         if (FD_ISSET(hw_socket, &rfds)) {
             cmd_t in{};
             std::string pl;
+            
             if (!read_cmd(hw_socket, &in, &pl)) {
                 device_gone = true;
                 break;
@@ -226,15 +206,17 @@ static void hardware_handler(int hw_socket, device_mac mac,
 
         // --- Hay comando(s) del Controller en la Cmd queue -------------
         if (FD_ISSET(notify_r, &rfds)) {
-            // Drenamos el pipe: 1 byte == 1 elemento ya Put() en la cola
-            // (el byte se escribe DESPUÉS del Put, así que Get() no bloquea).
             char drain[256];
             int pending = 0;
             ssize_t r;
+
             while ((r = read(notify_r, drain, sizeof(drain))) > 0)
                 pending += (int)r;
+            
 
             for (int i = 0; i < pending && !device_gone; ++i) {
+
+                // Obtengo siguiente comando 
                 cmd_t cmd = cmd_q->Get();
 
                 // CTRL_BYE interno: el device se va, terminamos el handler.
@@ -249,6 +231,7 @@ static void hardware_handler(int hw_socket, device_mac mac,
                 // por on_hw_event sin perder la correlación por request_id.
                 cmd_t resp{};
                 std::string resp_pl;
+
                 bool ok = write_cmd_and_wait_response(
                     hw_socket, cmd, &resp, &resp_pl, "", on_hw_event);
 
@@ -268,6 +251,10 @@ static void hardware_handler(int hw_socket, device_mac mac,
     // --- Limpieza: el device se fue ---
     close(hw_socket);
     {
+        // Hago eliminación sobre lista
+        // Tal vez sería mejor implementar una 
+        // Lista con guardas internas 
+        // TODO 
         std::lock_guard<std::mutex> lk(hw_table_mtx);
         for (auto it = hardware_client_table.begin();
              it != hardware_client_table.end(); ++it) {
@@ -281,10 +268,14 @@ static void hardware_handler(int hw_socket, device_mac mac,
         std::lock_guard<std::mutex> lk(cmd_queues_mtx);
         cmd_queues.erase(mac);
     }
+    // Cierro pipe interno
     close(notify_r);
     close(notify_w);
+    
+    // Elimino cmd_q  
     cmd_q->Detach();
     ShmQueue<cmd_t>::Destroy(cmd_queue_name(mac).c_str());
+    
     // Aviso a los Admins (EVENT, sin respuesta esperada).
     cmd_t ev = make_cmd(API_CONTROL, CTRL_DEVICE_GONE, EVENT, mac);
     broadcast_to_admins(ev);
@@ -305,6 +296,9 @@ static void connection_point(int listen_fd) {
 
         // Handshake: esperamos CTRL_HELLO con los datos de la Pitaya.
         cmd_t hello{};
+
+        // Si no es comando hello deberíamos responder 
+        // como mala recepción  
         if (!read_cmd(hw_fd, &hello, nullptr) ||
             hello.header.api_id.family != API_CONTROL ||
             hello.header.api_id.function_id != CTRL_HELLO) {
@@ -324,6 +318,7 @@ static void connection_point(int listen_fd) {
             hardware_client_table.push_back(hc);
         }
 
+        // Creo uno Device channel 
         ShmQueue<cmd_t>* q =
             ShmQueue<cmd_t>::Create(cmd_queue_name(hc.hardware_mac).c_str(),
                                     QUEUE_CAP);
@@ -366,6 +361,7 @@ static void controller(int admin_fd) {
         if (!read_cmd(admin_fd, &cmd, &pl)) break;  // Admin se desconectó.
         dbg_cmd("ctrl<-admin", cmd, pl);
 
+        // Switch según
         if (cmd.header.api_id.family == API_CONTROL) {
             switch (cmd.header.api_id.function_id) {
                 case CTRL_HELLO: {
@@ -378,8 +374,10 @@ static void controller(int admin_fd) {
                     r.body.request_id = cmd.body.request_id;
                     r.body.origin_admin = my_admin;
                     r.body.retval = (int32_t)my_admin;
+                    
                     dbg_cmd("ctrl->admin", r);
                     write_cmd(admin_fd, r);
+                    
                     printf("[controller] admin conectado (id=%u)\n", my_admin);
                     break;
                 }
@@ -394,7 +392,7 @@ static void controller(int admin_fd) {
                     break;
                 }
                 case CTRL_BYE: {
-                    goto done;
+                    goto done; // Limpieza estilo C antiguo
                 }
                 default:
                     break;
@@ -403,15 +401,19 @@ static void controller(int admin_fd) {
         }
 
         // --- Comando de API dirigido a un device concreto ---
+        request_id admin_rid = cmd.body.request_id;   // guardo el rid del admin
         request_id rid = next_request_id++;
-        cmd.body.request_id = rid;
+        cmd.body.request_id = rid;                    // server-side rid hacia el device
         cmd.body.origin_admin = my_admin;
 
+        // Agrego llamada a unanswered_calls_table (con el rid original del admin).
         {
             std::lock_guard<std::mutex> lk(unanswered_mtx);
-            unanswered_calls_table[rid] = PendingCall{my_admin, admin_fd};
+            unanswered_calls_table[rid] =
+                PendingCall{my_admin, admin_fd, admin_rid};
         }
 
+        // Notifico la escritura sobre la queue
         ShmQueue<cmd_t>* q = nullptr;
         int notify_w = -1;
         {
@@ -429,20 +431,18 @@ static void controller(int admin_fd) {
             unanswered_calls_table.erase(rid);
             cmd_t r = cmd;
             r.header.type = RESPONSE;
+            r.body.request_id = admin_rid;   // restauro rid del admin
             r.body.retval = -1;
             dbg_cmd("ctrl->admin", r, "unknown device");
             write_cmd(admin_fd, r, "unknown device\n");
             continue;
         }
 
-        // Encolamos en la Cmd queue del device y despertamos su select()
-        // con 1 byte en el self-pipe (Put antes que el byte: cuando el
-        // Handler ve el byte, el elemento ya está en la cola).
         dbg_cmd("ctrl->device", cmd);
         q->Put(cmd);
         const char tick = 1;
         ssize_t wn = write(notify_w, &tick, 1);
-        (void)wn;
+        (void)wn; // Que es esto?
     }
 
 done:
@@ -454,6 +454,7 @@ done:
     printf("[controller] admin %u desconectado\n", my_admin);
 }
 
+//
 static void admin_connection_point(int listen_fd) {
     struct sockaddr_in cli_addr;
     socklen_t clilen = sizeof(cli_addr);
@@ -484,6 +485,9 @@ static void msg_handler() {
         }
         if (!found) continue;  // Respuesta huérfana (admin ya se fue).
 
+        // Restauro el rid original del admin antes de reenviarle la response.
+        m.cmd.body.request_id = pc.admin_request_id;
+
         std::string mp(m.payload, m.payload_len);
         dbg_cmd("ctrl->admin", m.cmd, mp);
         write_cmd(pc.admin_fd, m.cmd, mp);
@@ -494,9 +498,12 @@ static void msg_handler() {
 //  main
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
+    dbg_set_enabled(extract_flag(&argc, argv, "-v"));
+
+    // Chequeo de uso
     if (argc < 3) {
         fprintf(stderr,
-                "Uso: %s <puerto_hardware> <puerto_admin>\n", argv[0]);
+                "Uso: %s [-v] <puerto_hardware> <puerto_admin>\n", argv[0]);
         exit(1);
     }
 
@@ -505,6 +512,7 @@ int main(int argc, char* argv[]) {
     int hw_port    = atoi(argv[1]);
     int admin_port = atoi(argv[2]);
 
+    // Creo socket de escucha.
     int hw_listen = make_listener(hw_port);
     if (hw_listen < 0) error("ERROR listener hardware");
     int admin_listen = make_listener(admin_port);
