@@ -5,7 +5,8 @@
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/lib.sh"
 
-VERBOSE="${VERBOSE:--v}"           # default verbose, override con VERBOSE=""
+#VERBOSE="${VERBOSE:--v}"           # default verbose, override con VERBOSE=""
+VERBOSE=""
 PORT_HW="${PORT_HW:-9101}"
 PORT_ADMIN="${PORT_ADMIN:-9102}"
 MAC="${MAC:-AABBCCDDEEFF}"
@@ -46,8 +47,12 @@ pass_fail "$OUT_DIR/admin.log" "req=4"              "rid del Admin preservado"  
 pass_fail "$OUT_DIR/admin.log" "req=5"              "rid del Admin preservado (release)" || FAIL=1
 
 # --- Asserts de las nuevas llamadas a la RP API --------------------------
-pass_fail "$OUT_DIR/admin.log" "STEMlab"            "hp_cmn_Print llego al admin"         || FAIL=1
-pass_fail "$OUT_DIR/admin.log" "Configuration"      "osc_printRegset llego al admin"      || FAIL=1
-pass_fail "$OUT_DIR/admin.log" "amplitudeScale"     "generate_printRegset llego al admin" || FAIL=1
+# Sólo asserto las que estén actualmente activas en tests/test.txt.
+grep -q "^print_acq"      "$HERE/test.txt" && \
+    { pass_fail "$OUT_DIR/admin.log" "Configuration"   "osc_printRegset llego al admin"      || FAIL=1; }
+grep -q "^print_gen"      "$HERE/test.txt" && \
+    { pass_fail "$OUT_DIR/admin.log" "amplitudeScale"  "generate_printRegset llego al admin" || FAIL=1; }
+grep -q "^print_profile"  "$HERE/test.txt" && \
+    { pass_fail "$OUT_DIR/admin.log" "STEMlab"         "hp_cmn_Print llego al admin"         || FAIL=1; }
 
 if [ "$FAIL" -eq 0 ]; then echo "TEST e2e OK"; else echo "TEST e2e FALLIDO"; exit 1; fi

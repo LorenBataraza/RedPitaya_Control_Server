@@ -72,8 +72,29 @@ enum system_fn : uint16_t {
 };
 
 // Minor para API_ACQUISITION (oscilloscope.cpp en la RP API).
+//
+// Convenciones de marshalling sobre cmd_t.body.params (ver body_t en api.cpp):
+//   set_* con (channel, valor)   -> params.ii.a = channel, params.ii.b = valor
+//   set_* sin channel (e.g. threshold) -> params.i1 = valor
+//   get_* con channel            -> params.i1 = channel
+//   get_* sin channel            -> params (sin uso)
+// Las get_* devuelven el valor en response.body.retval.
 enum acquisition_fn : uint16_t {
-    ACQ_PRINT_REGSET = 0,  // -> osc_printRegset()
+    ACQ_PRINT_REGSET = 0,        // -> osc_printRegset()
+    ACQ_SET_DECIMATION,          // ii=(ch, dec)
+    ACQ_GET_DECIMATION,          // i1=ch ; retval=dec
+    ACQ_SET_AVERAGING,           // ii=(ch, 0|1)
+    ACQ_GET_AVERAGING,           // i1=ch ; retval=0|1
+    ACQ_SET_TRIGGER_SOURCE,      // ii=(ch, src)
+    ACQ_GET_TRIGGER_SOURCE,      // i1=ch ; retval=src
+    ACQ_SET_TRIGGER_DELAY,       // ii=(ch, delay)
+    ACQ_GET_TRIGGER_DELAY,       // i1=ch ; retval=delay
+    ACQ_SET_THRESHOLD_CHA,       // i1=threshold
+    ACQ_GET_THRESHOLD_CHA,       // retval=threshold
+    ACQ_SET_ARM_KEEP,            // ii=(ch, 0|1)
+    ACQ_GET_ARM_KEEP,            // i1=ch ; retval=0|1
+    ACQ_WRITE_DATA_INTO_MEM,     // ii=(ch, 0|1)
+    ACQ_RESET_WRITE_SM,          // i1=ch
 };
 
 // Minor para API_GENERATION.

@@ -163,6 +163,12 @@ int main(int argc, char* argv[]) {
         parsed_line p;
         if (!parse_admin_line(line, target, &p)) continue;
 
+        if (p.is_set_target) {
+            target = p.new_target;
+            std::cerr << "[admin] target -> " << std::hex
+                      << p.new_target << std::dec << "\n";
+            continue;
+        }
         if (p.is_sleep) {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(p.sleep_ms));

@@ -59,7 +59,7 @@ static std::map<device_mac, DeviceChannel> cmd_queues; // Mapeo queues a partir 
 static std::mutex cmd_queues_mtx;
 
 // Mensaje que viaja por la Msg queue desde un Hardware Handler al Msg Handler.
-static const size_t MSG_PAYLOAD_MAX = 65536;   // dumps de osc_printRegset() superan 1 KB
+static const size_t MSG_PAYLOAD_MAX = 65536;   // osc_printRegset() superan 1 KB
 struct Msg {
     cmd_t    cmd;
     uint32_t payload_len;
@@ -163,8 +163,8 @@ static void hardware_handler(int hw_socket, device_mac mac,
     // Indica cuando perdimos el dispositivo
     // Lo perdemos cuando 
     // Tenemos un error sobre el select()
-    // Tenemos error sobre la lectrua de la respuesta
-    // Tenemos un Bye
+    // Tenemos error sobre la lectrua de la respuesta read()
+    // Tenemos un Bye 
     bool device_gone = false; 
 
 

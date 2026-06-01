@@ -23,33 +23,65 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+
+// Definiciones del struct profiles_t (necesarias para que los stubs rp_HP*
+// lean valores reales del profile activo).
+#include "RedPitaya/rp-api/api-hw-profiles/src/common.h"
 
 // Códigos de retorno de la RP API.
 #define RP_OK   0
 #define RP_EMMD 4   // memory map failed
 
 // ============================================================================
+//  Profile activo
+//
+//  hardware_client.cpp llama set_active_profile() al arrancar (con el
+//  profile elegido por la flag -p). Si no se llamó, los stubs caen a valores
+//  hardcoded de un STEM 125-14 v1.1.
+// ============================================================================
+static profiles_t* g_active_profile = nullptr;
+
+extern "C" void set_active_profile(profiles_t* p) { g_active_profile = p; }
+extern "C" profiles_t* get_active_profile()       { return g_active_profile; }
+
+// ============================================================================
 //  Familia cmn_*  (declarada en common.h SIN extern "C" -> C++ name mangling)
 // ============================================================================
 
-int cmn_Map(size_t size, size_t /*offset*/, void** mapped) {
-    *mapped = calloc(size ? size : 1, 1);
-    return *mapped ? RP_OK : RP_EMMD;
+// Cache de buffers indexada por `offset` físico (OSC_BASE_ADDR,
+// GENERATE_BASE_ADDR, etc.). En la RP real, mmapear la misma dirección desde
+// dos lugares retorna la misma memoria; replicamos eso acá para que el state
+// escrito por osc_SetDecimation() (vía osc_Init) sea visible al
+// osc_printRegset() (que se mapea su propio puntero local).
+static std::unordered_map<size_t, void*> g_buffers;
+
+static void* get_or_alloc(size_t size, size_t offset) {
+    auto it = g_buffers.find(offset);
+    if (it != g_buffers.end()) return it->second;
+    void* p = calloc(size ? size : 1, 1);
+    if (p) g_buffers[offset] = p;
+    return p;
 }
 
-int cmn_InitMap(size_t size, size_t /*offset*/, void** mapped, int* fd) {
-    *mapped = calloc(size ? size : 1, 1);
+int cmn_Map(size_t size, size_t offset, void** mapped) {
+    void* p = get_or_alloc(size, offset);
+    if (mapped) *mapped = p;
+    return p ? RP_OK : RP_EMMD;
+}
+
+int cmn_InitMap(size_t size, size_t offset, void** mapped, int* fd) {
     if (fd) *fd = -1;
-    return *mapped ? RP_OK : RP_EMMD;
+    void* p = get_or_alloc(size, offset);
+    if (mapped) *mapped = p;
+    return p ? RP_OK : RP_EMMD;
 }
 
-int cmn_Unmap(size_t /*size*/, void** mapped) {
-    if (mapped && *mapped) { free(*mapped); *mapped = nullptr; }
+// No-op: nunca queremos liberar el buffer entre llamadas en el mock.
+// (Si quisieras destruir el state, hace falta un reset explícito.)
+int cmn_Unmap(size_t /*size*/, void** /*mapped*/) { return RP_OK; }
+int cmn_ReleaseClose(int /*fd*/, size_t /*size*/, void** /*mapped*/) {
     return RP_OK;
-}
-
-int cmn_ReleaseClose(int /*fd*/, size_t /*size*/, void** mapped) {
-    return cmn_Unmap(0, mapped);
 }
 
 int cmn_isEnableDebugReg() { return 0; }
@@ -104,28 +136,39 @@ int rp_CalibGetFastDACCalibValue(rp_channel_calib_t, rp_gen_gain_calib_t,
 
 extern "C" {
 
-uint8_t rp_HPGetFastADCChannelsCountOrDefault() { return 2; }
-bool    rp_HPIsFastDAC_PresentOrDefault()       { return true; }
-bool    rp_HPGetIsCalibInFPGAOrDefault()        { return false; }
+uint8_t rp_HPGetFastADCChannelsCountOrDefault() {
+    return g_active_profile ? g_active_profile->fast_adc_count_channels : 2;
+}
+bool rp_HPIsFastDAC_PresentOrDefault() {
+    return g_active_profile ? g_active_profile->is_dac_present : true;
+}
+bool rp_HPGetIsCalibInFPGAOrDefault() {
+    return g_active_profile ? g_active_profile->is_calib_in_fpga : false;
+}
 
 int rp_HPGetFastDACBits(uint8_t* value) {
-    if (value) *value = 14;
+    if (value) *value = g_active_profile ? g_active_profile->fast_dac_bits : 14;
     return RP_OK;
 }
 int rp_HPGetFastDACIsSigned(bool* value) {
-    if (value) *value = true;
+    if (value) *value = g_active_profile ? g_active_profile->fast_dac_is_sign : true;
     return RP_OK;
 }
-int rp_HPGetFastDACOutFullScale(uint8_t /*channel*/, float* value) {
-    if (value) *value = 1.0f;
+int rp_HPGetFastDACOutFullScale(uint8_t channel, float* value) {
+    if (value) {
+        if (g_active_profile && channel < MAX_CHANNELS)
+            *value = g_active_profile->fast_dac_out_full_scale[channel];
+        else
+            *value = 1.0f;
+    }
     return RP_OK;
 }
 int rp_HPGetHWDACFullScale(float* value) {
-    if (value) *value = 1.0f;
+    if (value) *value = g_active_profile ? g_active_profile->fast_dac_full_scale : 1.0f;
     return RP_OK;
 }
 int rp_HPGetIsGainDACx5(bool* value) {
-    if (value) *value = false;
+    if (value) *value = g_active_profile ? g_active_profile->is_DAC_gain_x5 : false;
     return RP_OK;
 }
 

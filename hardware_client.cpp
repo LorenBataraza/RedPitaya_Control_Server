@@ -7,39 +7,24 @@
  *  El stdout del programa se redirige a un buffer interno y se reenvía al
  *  Control con STD_OUTDEVICE para que llegue al Admin.
  *
- *  Uso:  ./hardware_client <control_ip> <puerto_hardware> [mac_hex]
+ *  Uso:  ./hardware_client <control_ip> <puerto_hardware> [mac_hex]:[pitaya_model]
  *
  * ========================================================================== */
 
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <cstring>
 #include <string>
 
 #include "api.cpp"
 
-// API real del submódulo Red Pitaya. Forward-declaramos sólo los símbolos
-// que usamos para no arrastrar los headers (que requieren std::span -> C++20)
-// y dejar este TU en C++17. Las TUs del submódulo se compilan con su propio
-// flag (-std=c++20) en el Makefile.
-//
 // Los *_printRegset() corren contra memoria heap-allocated gracias al shim
 // de cmn_Map definido en mock_cmn.cpp.
-
-// osc_* / generate_* están declarados en sus headers como C++ (sin extern "C")
-int osc_Init(int channels);
-int osc_Release();
-int osc_printRegset();
-int generate_Init();
-int generate_Release();
-int generate_printRegset();
-
-// hp_cmn_Print y getProfile_* están en bloques `extern "C"` en sus headers.
-extern "C" {
-struct profiles_t;     // opaco — sólo necesitamos punteros.
-int hp_cmn_Print(struct profiles_t* p);
-struct profiles_t* getProfile_STEM_125_10_v1_0();
-}
+#include "RedPitaya/rp-api/api/src/oscilloscope.h"   // osc_*
+#include "RedPitaya/rp-api/api/src/generate.h"       // generate_*
+#include "mock_cmn.h"                                // set_active_profile,
+                                                     // find_profile, etc.
 
 static int          g_socket = -1;
 static device_mac   g_mac    = 0;
@@ -73,31 +58,85 @@ static int call_rp_function(const cmd_t& cmd, std::string* out_text) {
             }
             break;
 
-        case API_ACQUISITION:
+        case API_ACQUISITION: {
+            // Lazy init: una sola vez por proceso. cmn_Map del shim es
+            // idempotente, así el state del osc_reg sobrevive entre set/get.
+            static bool osc_inited = false;
+            if (!osc_inited) { osc_Init(1); osc_inited = true; }
+
+            const auto ch_a = (rp_channel_t)cmd.body.params.ii.a;
+            const auto ch_i = (rp_channel_t)cmd.body.params.i1;
+            uint32_t v32 = 0;
+            bool     vb  = false;
+
             switch (cmd.header.api_id.function_id) {
                 case ACQ_PRINT_REGSET:
-                    osc_Init(1);
                     osc_printRegset();
-                    osc_Release();
                     return 0;
+                case ACQ_SET_DECIMATION:
+                    return osc_SetDecimation(ch_a,
+                        (uint32_t)cmd.body.params.ii.b);
+                case ACQ_GET_DECIMATION:
+                    osc_GetDecimation(ch_i, &v32);
+                    return (int)v32;
+                case ACQ_SET_AVERAGING:
+                    return osc_SetAveraging(ch_a, cmd.body.params.ii.b != 0);
+                case ACQ_GET_AVERAGING:
+                    osc_GetAveraging(ch_i, &vb);
+                    return vb ? 1 : 0;
+                case ACQ_SET_TRIGGER_SOURCE:
+                    return osc_SetTriggerSource(ch_a,
+                        (uint32_t)cmd.body.params.ii.b);
+                case ACQ_GET_TRIGGER_SOURCE:
+                    osc_GetTriggerSource(ch_i, &v32);
+                    return (int)v32;
+                case ACQ_SET_TRIGGER_DELAY:
+                    return osc_SetTriggerDelay(ch_a,
+                        (uint32_t)cmd.body.params.ii.b);
+                case ACQ_GET_TRIGGER_DELAY:
+                    osc_GetTriggerDelay(ch_i, &v32);
+                    return (int)v32;
+                case ACQ_SET_THRESHOLD_CHA:
+                    return osc_SetThresholdChA(
+                        (uint32_t)cmd.body.params.i1);
+                case ACQ_GET_THRESHOLD_CHA:
+                    osc_GetThresholdChA(&v32);
+                    return (int)v32;
+                case ACQ_SET_ARM_KEEP:
+                    return osc_SetArmKeep(ch_a, cmd.body.params.ii.b != 0);
+                case ACQ_GET_ARM_KEEP:
+                    osc_GetArmKeep(ch_i, &vb);
+                    return vb ? 1 : 0;
+                case ACQ_WRITE_DATA_INTO_MEM:
+                    return osc_WriteDataIntoMemory(ch_a,
+                        cmd.body.params.ii.b != 0);
+                case ACQ_RESET_WRITE_SM:
+                    return osc_ResetWriteStateMachine(ch_i);
             }
             break;
+        }
 
-        case API_GENERATION:
+        case API_GENERATION: {
+            // Lazy init: una sola vez por proceso (idem osc).
+            static bool gen_inited = false;
+            if (!gen_inited) { generate_Init(); gen_inited = true; }
+
             switch (cmd.header.api_id.function_id) {
                 case GEN_PRINT_REGSET:
-                    generate_Init();
                     generate_printRegset();
-                    generate_Release();
                     return 0;
             }
             break;
+        }
 
         case API_HW_PROFILE:
             switch (cmd.header.api_id.function_id) {
-                case HWP_PRINT:
-                    hp_cmn_Print(getProfile_STEM_125_10_v1_0());
+                case HWP_PRINT: {
+                    profiles_t* p = get_active_profile();
+                    if (!p) p = find_profile("STEM_125_10_v1_0");  // fallback
+                    hp_cmn_Print(p);
                     return 0;
+                }
             }
             break;
 
@@ -121,14 +160,43 @@ static void catchSigEnv(int) {
     _exit(0);
 }
 
+// Busca "-p <name>" en argv y lo extrae (devuelve nullptr si no estaba).
+static const char* extract_profile_flag(int* argc, char** argv) {
+    for (int i = 1; i + 1 < *argc; ++i) {
+        if (strcmp(argv[i], "-p") == 0) {
+            const char* name = argv[i + 1];
+            for (int j = i; j + 2 < *argc; ++j) argv[j] = argv[j + 2];
+            *argc -= 2;
+            return name;
+        }
+    }
+    return nullptr;
+}
+
 int main(int argc, char* argv[]) {
     dbg_set_enabled(extract_flag(&argc, argv, "-v"));
-
+    
     if (argc < 3) {
         fprintf(stderr,
-                "Uso: %s [-v] <control_ip> <puerto_hw> [mac_hex]\n", argv[0]);
+            "Uso: %s [-v] [-p <profile>] <control_ip> <puerto_hw> "
+            "[mac_hex]\n", argv[0]);
+            return 1;
+        }
+        
+    const char* profile_name = extract_profile_flag(&argc, argv);
+    if (!profile_name) profile_name = "STEM_125_10_v1_0";
+
+    // Elegir profile (default si no se pasó -p) y dejarlo activo para los
+    // stubs rp_HP* y para HWP_PRINT.
+    profiles_t* p = find_profile(profile_name);
+    if (!p) {
+        fprintf(stderr, "ERROR: profile '%s' desconocido.\n", profile_name);
+        print_profile_names();
         return 1;
     }
+    set_active_profile(p);
+    fprintf(stderr, "[hw] profile activo: %s\n", profile_name);
+
     const char* control_ip = argv[1];
     int         hw_port    = atoi(argv[2]);
     g_mac = (argc > 3) ? strtoull(argv[3], nullptr, 16) : 0xAABBCCDDEEFFULL;
@@ -150,8 +218,8 @@ int main(int argc, char* argv[]) {
 
     // Handshake: me presento ante el Control.
     cmd_t hello = make_cmd(API_CONTROL, CTRL_HELLO, REQUEST, g_mac);
-    hello.body.params.ii.a = STEM_125_14_v1_1;  // model
-    hello.body.params.ii.b = Z7010;             // zynq model
+    hello.body.params.ii.a = p->boardModel;              // model
+    hello.body.params.ii.b = p->zynqCPUModel;             // zynq model
     cmd_t ack{};
     if (!write_cmd_and_wait_response(g_socket, hello, &ack)) {
         fprintf(stderr, "ERROR: handshake fallido\n");
