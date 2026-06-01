@@ -1,0 +1,13 @@
+# Secuencia de comandos del test e2e.
+# El admin_client lee línea por línea y manda cada comando al Control.
+
+hello
+list
+init
+version
+release
+# print_profile
+# print_acq
+# print_gen
+sleep 500
+list
