@@ -7,7 +7,7 @@
 //  Las definiciones reales están en mock_cmn.cpp (shim de cmn_Map + stubs
 //  rp_HP*) y profile_lookup.cpp (tabla nombre -> getProfile_*).
 // ============================================================================
-
+#include <cstddef>
 #include "RedPitaya/rp-api/api-hw-profiles/src/common.h"   // profiles_t
 
 #ifdef __cplusplus

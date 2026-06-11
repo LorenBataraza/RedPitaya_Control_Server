@@ -84,9 +84,12 @@ $(BUILD_DIR)/control_server: control_server.cpp api.cpp include/ShmQueue.h | $(B
 HW_CXXFLAGS = $(subst -std=c++17,-std=c++20,$(CXXFLAGS)) \
               -ffunction-sections -fdata-sections -Wno-volatile
 
-$(BUILD_DIR)/hardware_client: hardware_client.cpp api.cpp mock_cmn.cpp mock_cmn.h profile_lookup.cpp $(RP_OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/mock_cmn.o: mock_cmn.cpp mock_cmn.h | $(BUILD_DIR)
+	$(CXX) $(HW_CXXFLAGS) $(RP_INC) -c -o $@ mock_cmn.cpp
+
+$(BUILD_DIR)/hardware_client: hardware_client.cpp api.cpp profile_lookup.cpp $(BUILD_DIR)/mock_cmn.o $(RP_OBJS) | $(BUILD_DIR)
 	$(CXX) $(HW_CXXFLAGS) $(RP_INC) \
-	    -o $@ hardware_client.cpp mock_cmn.cpp profile_lookup.cpp $(RP_OBJS) \
+	    -o $@ hardware_client.cpp profile_lookup.cpp $(BUILD_DIR)/mock_cmn.o $(RP_OBJS) \
 	    $(LDFLAGS) $(RP_LDFLAGS)
 
 $(BUILD_DIR)/admin_client: admin_main.cpp admin_cmd_reader.cpp admin_cmd_reader.h api.cpp | $(BUILD_DIR)
